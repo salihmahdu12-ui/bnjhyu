@@ -1,155 +1,11 @@
-// ===== Emit hardened encrypted Lua VM =====
-// Layers: rolling-XOR bytecode + per-string encryption + opcode remapping
-// (polymorphism: each build maps logical ops to random physical bytes) +
-// bytecode checksum (tamper detection) embedded in the payload.
-const {OP,compileProgram}=require('./compiler');
-const {lex,parse}=require('./frontend');
-
-function rollXor(bytes,seed,mult){const o=[];for(let n=0;n<bytes.length;n++)o.push((bytes[n]^((seed+n*mult)&0xFF))&0xFF);return o;}
-function encStr(s,seed,mult){return rollXor([...Buffer.from(s,'utf8')],seed,mult);}
-
-// Build a random permutation of opcode values: logical OP value -> physical byte.
-// We keep all values within 0..255 and ensure uniqueness.
-function makeOpcodeMap(rng){
-  const logical=Object.values(OP);
-  const used=new Set();
-  const map={}; // logical -> physical
-  for(const lv of logical){
-    let pv;
-    do{pv=rng()&0x7F;}while(used.has(pv)); // keep in 0..127 for simplicity
-    used.add(pv);map[lv]=pv;
-  }
-  return map;
-}
-
-// checksum over a byte array: simple but position-sensitive rolling hash mod 2^24
-function checksum(bytes){
-  let h=0x811c>>>0; // seed
-  for(let i=0;i<bytes.length;i++){
-    h=(h ^ bytes[i])>>>0;
-    h=((h*16777619)>>>0) & 0xFFFFFF; // keep 24-bit to be Lua-number-safe
-    h=(h + ((i*131)&0xFFFFFF))>>>0 & 0xFFFFFF;
-  }
-  return h & 0xFFFFFF;
-}
-
-let RNG;
-function serProto(proto,opmap){
-  // remap opcodes in this proto's code (only the opcode bytes; operands stay).
-  // We must know which bytes are opcodes vs operands. Re-walk using OP arity.
-  const remapped=remapCode(proto.code,opmap);
-  const cseed=RNG()&0xFF,cmult=(RNG()%30)+3;
-  const encCode=rollXor(remapped,cseed,cmult);
-
-  const constParts=proto.consts.map(v=>{
-    if(typeof v==='number')return `{n=${v}}`;
-    const sseed=RNG()&0xFF,smult=(RNG()%30)+3;
-    return `{s=1,k1=${sseed},k2=${smult},d={${encStr(v,sseed,smult).join(',')}}}`;
-  }).join(',');
-  const ups=proto.upvals.map(u=>`{p=${u.fromParentLocal?1:0},i=${u.index}}`).join(',');
-  const subs=proto.protos.map(p=>serProto(p,opmap)).join(',');
-  return `{cs=${cseed},cm=${cmult},c={${encCode.join(',')}},k={${constParts}},`+
-         `u={${ups}},np=${proto.nparams},va=${proto.isVararg?1:0},ms=${proto.maxslot},p={${subs}}}`;
-}
-
-// Build Lua text AND a plain-object mirror (for checksum) in lockstep.
-// Returns {text, obj} so nested protos compose correctly.
-function serProtoM(proto,opmap){
-  const remapped=remapCode(proto.code,opmap);
-  const cseed=RNG()&0xFF,cmult=(RNG()%30)+3;
-  const encCode=rollXor(remapped,cseed,cmult);
-
-  const kObjs=[],kTexts=[];
-  for(const v of proto.consts){
-    if(typeof v==='number'){kObjs.push({n:v});kTexts.push(`{n=${v}}`);}
-    else{const sseed=RNG()&0xFF,smult=(RNG()%30)+3;const d=encStr(v,sseed,smult);
-      kObjs.push({s:1,k1:sseed,k2:smult,d:d.slice()});
-      kTexts.push(`{s=1,k1=${sseed},k2=${smult},d={${d.join(',')}}}`);}
-  }
-  const uObjs=proto.upvals.map(u=>({p:u.fromParentLocal?1:0,i:u.index}));
-  const uTexts=proto.upvals.map(u=>`{p=${u.fromParentLocal?1:0},i=${u.index}}`);
-  const subResults=proto.protos.map(p=>serProtoM(p,opmap));
-  const pObjs=subResults.map(r=>r.obj);
-  const pTexts=subResults.map(r=>r.text);
-
-  const obj={cs:cseed,cm:cmult,c:encCode.slice(),k:kObjs,u:uObjs,
-             np:proto.nparams,va:proto.isVararg?1:0,ms:proto.maxslot,p:pObjs};
-  const text=`{cs=${cseed},cm=${cmult},c={${encCode.join(',')}},k={${kTexts.join(',')}},`+
-             `u={${uTexts.join(',')}},np=${proto.nparams},va=${proto.isVararg?1:0},ms=${proto.maxslot},p={${pTexts.join(',')}}}`;
-  return {text,obj};
-}
-
-// opcode arities (operand bytes following each opcode)
-const ARITY={
-  [OP.PUSHK]:1,[OP.PUSHNIL]:0,[OP.PUSHT]:0,[OP.PUSHF]:0,
-  [OP.GETL]:1,[OP.SETL]:1,[OP.GETUP]:1,[OP.SETUP]:1,[OP.GETG]:1,
-  [OP.NEWTBL]:0,[OP.GETIDX]:0,[OP.SETIDX]:0,[OP.SETARR]:1,
-  [OP.ADD]:0,[OP.SUB]:0,[OP.MUL]:0,[OP.DIV]:0,[OP.MOD]:0,[OP.CONCAT]:0,[OP.LEN]:0,[OP.NEG]:0,
-  [OP.EQ]:0,[OP.NE]:0,[OP.LT]:0,[OP.GT]:0,[OP.LE]:0,[OP.GE]:0,[OP.NOT]:0,
-  [OP.JMP]:1,[OP.JZ]:1,
-  [OP.CLOSURE]:1,[OP.CALL]:2,[OP.RET]:1,[OP.POP]:0,[OP.VARARG]:0,[OP.GETVARG]:1,[OP.PACKVARG]:0,
-  [OP.PRINT]:0,[OP.HALT]:0
-};
-
-function remapCode(code,opmap){
-  const out=new Array(code.length);
-  let i=0;
-  while(i<code.length){
-    const op=code[i];
-    const ar=ARITY[op];
-    if(ar===undefined)throw new Error('remap: unknown opcode 0x'+op.toString(16)+' @'+i);
-    out[i]=opmap[op];           // remap opcode byte
-    for(let j=1;j<=ar;j++)out[i+j]=code[i+j]; // copy operands verbatim
-    i+=1+ar;
-  }
-  return out;
-}
-
-function obfuscate(src){
-  const proto=compileProgram(parse(lex(src)));
-  let st=(Math.random()*2**31)>>>0;
-  RNG=()=>{st=(Math.imul(st,1103515245)+12345)>>>0;return st&0x7fffffff;};
-  const opmap=makeOpcodeMap(RNG);
-
-  // Build Lua text + JS mirror together for an exact checksum match.
-  const {text:tree,obj:mirrorRoot}=serProtoM(proto,opmap);
-
-  // canonical serialize matching Lua serialize(): arrays 1-based, keys sorted
-  // (numbers before strings, each ascending).
-  function ser(v){
-    if(typeof v==='number')return Number.isInteger(v)?String(v):String(v);
-    if(typeof v==='string')return v;
-    if(typeof v==='boolean')return v?'true':'false';
-    if(Array.isArray(v)){
-      const parts=[];
-      for(let i=0;i<v.length;i++)parts.push((i+1)+'='+ser(v[i])); // 1-based
-      return '{'+parts.join(',')+'}';
-    }
-    if(v&&typeof v==='object'){
-      const keys=Object.keys(v);
-      keys.sort((a,b)=>{
-        const na=/^-?\d+$/.test(a),nb=/^-?\d+$/.test(b);
-        const ta=na?0:1,tb=nb?0:1;
-        if(ta===tb){if(ta===0)return (+a)-(+b);return a<b?-1:a>b?1:0;}
-        return ta-tb;
-      });
-      return '{'+keys.map(k=>k+'='+ser(v[k])).join(',')+'}';
-    }
-    return '';
-  }
-  function bxor(a,b){let r=0,bit=1;while(a>0||b>0){const x=a%2,y=b%2;if(x!==y)r+=bit;a=(a-x)/2;b=(b-y)/2;bit*=2;}return r;}
-  function checksum(s){let h=0x811c;for(let i=0;i<s.length;i++){const b=s.charCodeAt(i);h=bxor(h,b);h=(h*16777619)%16777216;h=(h+(i*131))%16777216;}return h%16777216;}
-  const CHK=checksum(ser(mirrorRoot));
-
-  const M=opmap;
-  return `-- ============================================================
+-- ============================================================
 -- AUTO-GENERATED HARDENED VM PAYLOAD (private build)
 -- Protections: custom bytecode VM, rolling-XOR code, per-string
 -- encryption, per-build opcode remapping, integrity checksum.
 -- Editing this file changes the checksum and it will refuse to run.
 -- ============================================================
-local P=${tree}
-local CHK=${CHK}
+local P={cs=194,cm=12,c={242,138,218,177,242,133,10,67,34,106,59,17,82,37,106,33,131,160,226,241,178,197,203,131,227,170,248,81,18,101,43,97,64,96,34,49,114,5,136,195,160,234,185,145,210,165,232,161,1,32,98,115,49,122,78,1,98,21,122,175,233,157,209,178,168,204,219,162,247,141,15,65,34,85,56,111,5,91,0,119,131,228,155,166,229,190,177,215,203,185,255,81,18,101,42,31,57,72,33,96,24,124,139,252,160,175,254,192,161,219,189,240,121,9,51,76,51,62,57,83,53,104,1,142,187,244,171,182,149,202,234,157,251,177,11,109,40,97,56,61,89,17,105,13,142,193,158,243,182,197,199,188,225,239,190,1,97,27,125,49,40,79,90,51,119,58,130,193,170,213,180,189,214,165,229,141,18,100,30,37,118,53,14,92,38,103,9,131,197,151,192,183,194,189,223,177,248,148,11,22,81,43,109,77,56,95,106,5,135,253,139,221,160,151,177,197,153,250,144,4,19,116,43,54,25,78},k={{s=1,k1=16,k2=16,d={126,69,71}},{s=1,k1=14,k2=20,d={111,70,82}},{s=1,k1=60,k2=12,d={80,45,58,7,24,16}},{n=3},{n=4},{s=1,k1=26,k2=22,d={106,66,47,50,6}},{n=1},{s=1,k1=40,k2=26,d={80}},{s=1,k1=230,k2=24,d={159}},{n=10},{n=20},{n=30},{n=40},{n=0},{n=2},{n=6},{n=8},{s=1,k1=212,k2=14,d={167,150,130,151,98,125}},{s=1,k1=114,k2=8,d={20,21,240,231,243,238}},{s=1,k1=64,k2=18,d={12,59,6,4,233,232,213,158,245,145,212,116,125,75,88,55}},{s=1,k1=190,k2=10,d={200,250}}},u={},np=0,va=1,ms=12,p={{cs=108,cm=30,c={92,241,168,145,228,44,91,63,11,123,182,237,213,169,16},k={{s=1,k1=202,k2=18,d={178}},{s=1,k1=88,k2=20,d={33}}},u={},np=2,va=0,ms=2,p={}},{cs=150,cm=20,c={187,170,197,210,207,173,14,89,55,99,9,115,253,155,135,158,129,234,133,16,15,109,79,25,116,163,194,216,196,219,181,3,77,42},k={{s=1,k1=4,k2=28,d={106,69,75}},{s=1,k1=34,k2=22,d={90}},{s=1,k1=112,k2=6,d={9}}},u={{p=1,i=0}},np=2,va=0,ms=2,p={}},{cs=110,cm=30,c={29,140,209,201,207,83,34,59,92,85,205,184,173,246,59,10,25,108,241,171,239,179,2,91,61,117,64,196,220,213,243,75,47,23,106},k={{s=1,k1=156,k2=10,d={241,199,196,210}},{s=1,k1=122,k2=28,d={9,231,192,186}},{s=1,k1=136,k2=30,d={240}},{s=1,k1=70,k2=32,d={63}}},u={},np=1,va=0,ms=1,p={}},{cs=52,cm=24,c={99,78,32,127,231,172,147,220,158,13,39,120,82,40,129,216,176,155,224,171,17,123,66,54,118,142,224,180,144,235,83,27,44,56,104,90,171,151,147,219,176,10,115,61,3,111,211,148,222,206,229,184,29,123,77,24,119,179,181,235,215,183,5,71,52},k={{s=1,k1=210,k2=16,d={187,146,147,107,96,81}}},u={},np=3,va=0,ms=10,p={}},{cs=160,cm=26,c={247,186,131,239,84,121,61,13,112},k={},u={},np=2,va=0,ms=2,p={}},{cs=30,cm=8,c={101,38,106,54,69,70,10,87,45,103,89,28,127,133,202,146,218,165,234,180,233,196,153,213,137,226,132,244,252,66,8,82,27,113,43,46,74,74,103,105,27,49,107,50,122,209,142,237,156,250,234,177,233,193,138,214,137,231,185,240,162,66,6,65,22,98,47,9,42,17,78,1,95,49,111,33,126,237,213,149,197,166},k={{n=0},{s=1,k1=204,k2=8,d={165,164,189,141,158,135}},{n=1}},u={},np=0,va=1,ms=9,p={}}}}
+local CHK=7887705
 
 local function bxor(a,b) local r,bit=0,1 while a>0 or b>0 do local x,y=a%2,b%2 if x~=y then r=r+bit end a=(a-x)/2 b=(b-y)/2 bit=bit*2 end return r end
 
@@ -186,14 +42,14 @@ end
 if checksum(serialize(P))~=CHK then error("integrity check failed: file was modified") end
 
 -- physical opcode constants for this build:
-local O_PUSHK=${M[OP.PUSHK]} local O_PUSHNIL=${M[OP.PUSHNIL]} local O_PUSHT=${M[OP.PUSHT]} local O_PUSHF=${M[OP.PUSHF]}
-local O_GETL=${M[OP.GETL]} local O_SETL=${M[OP.SETL]} local O_GETUP=${M[OP.GETUP]} local O_SETUP=${M[OP.SETUP]} local O_GETG=${M[OP.GETG]}
-local O_NEWTBL=${M[OP.NEWTBL]} local O_GETIDX=${M[OP.GETIDX]} local O_SETIDX=${M[OP.SETIDX]} local O_SETARR=${M[OP.SETARR]}
-local O_ADD=${M[OP.ADD]} local O_SUB=${M[OP.SUB]} local O_MUL=${M[OP.MUL]} local O_DIV=${M[OP.DIV]} local O_MOD=${M[OP.MOD]} local O_CONCAT=${M[OP.CONCAT]} local O_LEN=${M[OP.LEN]} local O_NEG=${M[OP.NEG]}
-local O_EQ=${M[OP.EQ]} local O_NE=${M[OP.NE]} local O_LT=${M[OP.LT]} local O_GT=${M[OP.GT]} local O_LE=${M[OP.LE]} local O_GE=${M[OP.GE]} local O_NOT=${M[OP.NOT]}
-local O_JMP=${M[OP.JMP]} local O_JZ=${M[OP.JZ]}
-local O_CLOSURE=${M[OP.CLOSURE]} local O_CALL=${M[OP.CALL]} local O_RET=${M[OP.RET]} local O_POP=${M[OP.POP]} local O_VARARG=${M[OP.VARARG]} local O_GETVARG=${M[OP.GETVARG]} local O_PACKVARG=${M[OP.PACKVARG]}
-local O_PRINT=${M[OP.PRINT]} local O_HALT=${M[OP.HALT]}
+local O_PUSHK=123 local O_PUSHNIL=24 local O_PUSHT=113 local O_PUSHF=86
+local O_GETL=87 local O_SETL=68 local O_GETUP=45 local O_SETUP=98 local O_GETG=115
+local O_NEWTBL=48 local O_GETIDX=41 local O_SETIDX=46 local O_SETARR=79
+local O_ADD=92 local O_SUB=101 local O_MUL=58 local O_DIV=107 local O_MOD=72 local O_CONCAT=97 local O_LEN=6 local O_NEG=71
+local O_EQ=116 local O_NE=29 local O_LT=18 local O_GT=99 local O_LE=96 local O_GE=25 local O_NOT=94
+local O_JMP=63 local O_JZ=12
+local O_CLOSURE=85 local O_CALL=106 local O_RET=91 local O_POP=120 local O_VARARG=81 local O_GETVARG=54 local O_PACKVARG=55
+local O_PRINT=36 local O_HALT=13
 
 local function dcode(p,pos) local k=(p.cs+pos*p.cm)%256 return bxor(p.c[pos+1],k)%256 end
 
@@ -210,7 +66,7 @@ local function tset(t,k,v) if type(t)~="table" then return end if type(k)=="numb
 -- builtin globals
 local G={}
 local function nat(f) return {__fn=true,native=f} end
-G.print=nat(function(a) local parts={} for i=1,#a do parts[i]=lstr(a[i]) end print(table.concat(parts,"\t")) return {} end)
+G.print=nat(function(a) local parts={} for i=1,#a do parts[i]=lstr(a[i]) end print(table.concat(parts,"	")) return {} end)
 G.pairs=nat(function(a) local t=a[1] local keys={} for i=1,#t.arr do keys[#keys+1]=i end for k in pairs(t.hash) do keys[#keys+1]=k end local idx=0
   local it=nat(function() idx=idx+1 if idx>#keys then return {nil} end local k=keys[idx] return {k,tget(t,k)} end) return {it,t,nil} end)
 G.ipairs=nat(function(a) local t=a[1]
@@ -307,23 +163,3 @@ end
 
 local main={__fn=true,proto=P,ups={}}
 callClosure(main,{})
-`;
-}
-
-module.exports={obfuscate};
-
-if(require.main===module){
-  const fs=require('fs');
-  const inp=process.argv[2];
-  const src=inp?fs.readFileSync(inp,'utf8'):`
-local function map(t,f) local r={} for i,v in ipairs(t) do r[i]=f(v) end return r end
-local nums={1,2,3,4,5}
-local doubled=map(nums,function(x) return x*2 end)
-for _,v in ipairs(doubled) do print(v) end
-local function multi() return 1,2,3 end
-local a,b,c=multi() print(a+b+c)
-print(string.upper("done"))
-`;
-  fs.writeFileSync('out.lua',obfuscate(src));
-  console.log('wrote out.lua ('+fs.statSync('out.lua').size+' bytes)');
-}

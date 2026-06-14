@@ -1,11 +1,10 @@
-// ===== Advanced mini-Lua front end: lexer + parser =====
-// Supports: numbers, strings, booleans, nil, variables (local),
-// arithmetic/comparison/logical ops, if/elseif/else, while,
-// tables { } with [k]=v and array entries, indexing t[k] and t.k,
-// function definitions (named + anonymous), calls, return, closures.
-
+// ===== Extended mini-Lua front end =====
+// Adds over vm2: vararg (...), multiple return (return a,b),
+// multiple assignment (a,b = f()), generic for (for k,v in pairs(t)),
+// method-ish calls already covered by index+call, builtin names.
 const KW=new Set(['local','if','then','elseif','else','end','while','do',
-  'function','return','true','false','nil','and','or','not','for','in','print']);
+  'function','return','true','false','nil','and','or','not','for','in','print',
+  'break']);
 
 function lex(src){
   const T=[];let i=0;const D=c=>c>='0'&&c<='9';const A=c=>/[A-Za-z_]/.test(c);
@@ -26,7 +25,6 @@ function lex(src){
 
 function parse(toks){
   let p=0;const pk=()=>toks[p];const nx=()=>toks[p++];
-  const is=(t,v)=>pk().t===t&&(v===undefined||pk().v===v);
   const eat=(v)=>{const t=nx();if(t.v!==v)throw new Error(`parse: expected '${v}' got '${t.v}'`);return t;};
   const BP={'or':1,'and':2,'==':3,'~=':3,'<':4,'>':4,'<=':4,'>=':4,'..':5,'+':6,'-':6,'*':7,'/':7,'%':7};
 
@@ -38,10 +36,11 @@ function parse(toks){
     if(t.t==='kw'&&t.v==='false'){nx();return{k:'bool',v:false};}
     if(t.t==='kw'&&t.v==='nil'){nx();return{k:'nil'};}
     if(t.t==='kw'&&t.v==='not'){nx();return{k:'not',e:unary()};}
-    if(t.t==='kw'&&t.v==='function'){nx();return funcbody(null);}
+    if(t.t==='kw'&&t.v==='function'){nx();return funcbody();}
     if(t.t==='op'&&t.v==='-'){nx();return{k:'neg',e:unary()};}
     if(t.t==='op'&&t.v==='#'){nx();return{k:'len',e:unary()};}
-    if(t.t==='op'&&t.v==='('){nx();const e=expr(0);eat(')');return e;}
+    if(t.t==='op'&&t.v==='...'){nx();return{k:'vararg'};}
+    if(t.t==='op'&&t.v==='('){nx();const e=expr(0);eat(')');return{k:'paren',e};}
     if(t.t==='op'&&t.v==='{'){return tablecons();}
     if(t.t==='id'){nx();return{k:'var',v:t.v};}
     throw new Error('parse: unexpected in expr '+JSON.stringify(t));
@@ -51,11 +50,15 @@ function parse(toks){
     while(true){const t=pk();
       if(t.t==='op'&&t.v==='.'){nx();const n=nx();e={k:'index',obj:e,key:{k:'str',v:n.v}};}
       else if(t.t==='op'&&t.v==='['){nx();const idx=expr(0);eat(']');e={k:'index',obj:e,key:idx};}
-      else if(t.t==='op'&&t.v==='('){nx();const args=[];if(!(pk().t==='op'&&pk().v===')')){args.push(expr(0));while(pk().t==='op'&&pk().v===','){nx();args.push(expr(0));}}eat(')');e={k:'call',fn:e,args};}
+      else if(t.t==='op'&&t.v===':'){nx();const m=nx().v;eat('(');const args=callargs();eat(')');e={k:'method',obj:e,name:m,args};}
+      else if(t.t==='op'&&t.v==='('){nx();const args=callargs();eat(')');e={k:'call',fn:e,args};}
+      else if(t.t==='str'){const s=nx();e={k:'call',fn:e,args:[{k:'str',v:s.v}]};}
+      else if(t.t==='op'&&t.v==='{'){const tb=tablecons();e={k:'call',fn:e,args:[tb]};}
       else break;
     }
     return e;
   }
+  function callargs(){const args=[];if(!(pk().t==='op'&&pk().v===')')){args.push(expr(0));while(pk().t==='op'&&pk().v===','){nx();args.push(expr(0));}}return args;}
   function unary(){return suffixed();}
   function expr(minbp){
     let left=unary();
@@ -76,23 +79,33 @@ function parse(toks){
     }
     eat('}');return{k:'table',fields};
   }
-  function funcbody(name){
-    eat('(');const params=[];
-    if(!(pk().t==='op'&&pk().v===')')){params.push(nx().v);while(pk().t==='op'&&pk().v===','){nx();params.push(nx().v);}}
+  function funcbody(){
+    eat('(');const params=[];let isVararg=false;
+    if(!(pk().t==='op'&&pk().v===')')){
+      while(true){
+        if(pk().t==='op'&&pk().v==='...'){nx();isVararg=true;break;}
+        params.push(nx().v);
+        if(pk().t==='op'&&pk().v===','){nx();continue;}
+        break;
+      }
+    }
     eat(')');const body=block(['end']);eat('end');
-    return{k:'func',name,params,body};
+    return{k:'func',params,isVararg,body};
   }
   function stmt(){
     const t=pk();
     if(t.t==='kw'&&t.v==='local'){nx();
-      if(pk().t==='kw'&&pk().v==='function'){nx();const name=nx().v;const f=funcbody(name);return{k:'localfunc',name,f};}
-      const name=nx().v;let e={k:'nil'};if(pk().t==='op'&&pk().v==='='){nx();e=expr(0);}return{k:'local',name,e};
+      if(pk().t==='kw'&&pk().v==='function'){nx();const name=nx().v;const f=funcbody();return{k:'localfunc',name,f};}
+      const names=[nx().v];while(pk().t==='op'&&pk().v===','){nx();names.push(nx().v);}
+      let exprs=[];if(pk().t==='op'&&pk().v==='='){nx();exprs.push(expr(0));while(pk().t==='op'&&pk().v===','){nx();exprs.push(expr(0));}}
+      return{k:'local',names,exprs};
     }
     if(t.t==='kw'&&t.v==='function'){nx();
-      // function name or name.field
-      let base=nx().v;let target={k:'var',v:base};let methodName=base;
-      while(pk().t==='op'&&pk().v==='.'){nx();const n=nx().v;target={k:'index',obj:target,key:{k:'str',v:n}};methodName=n;}
-      const f=funcbody(methodName);return{k:'assign',target,e:f};
+      let target={k:'var',v:nx().v};let isMethod=false;
+      while(pk().t==='op'&&pk().v==='.'){nx();const n=nx().v;target={k:'index',obj:target,key:{k:'str',v:n}};}
+      if(pk().t==='op'&&pk().v===':'){nx();const n=nx().v;target={k:'index',obj:target,key:{k:'str',v:n}};isMethod=true;}
+      const f=funcbody();if(isMethod)f.params.unshift('self');
+      return{k:'assign',targets:[target],exprs:[f]};
     }
     if(t.t==='kw'&&t.v==='if'){nx();const c=expr(0);eat('then');const b=block(['elseif','else','end']);
       const clauses=[{c,b}];let elseb=null;
@@ -101,13 +114,30 @@ function parse(toks){
       eat('end');return{k:'if',clauses,elseb};
     }
     if(t.t==='kw'&&t.v==='while'){nx();const c=expr(0);eat('do');const b=block(['end']);eat('end');return{k:'while',c,b};}
-    if(t.t==='kw'&&t.v==='for'){nx();const v=nx().v;eat('=');const a=expr(0);eat(',');const b=expr(0);let step=null;if(pk().t==='op'&&pk().v===','){nx();step=expr(0);}eat('do');const body=block(['end']);eat('end');return{k:'fornum',v,a,b,step,body};}
-    if(t.t==='kw'&&t.v==='return'){nx();let e=null;if(!(pk().t==='kw'&&(pk().v==='end'||pk().v==='elseif'||pk().v==='else'))&&pk().t!=='eof')e=expr(0);return{k:'return',e};}
-    if(t.t==='kw'&&t.v==='print'){nx();eat('(');const e=expr(0);eat(')');return{k:'print',e};}
-    // expression statement or assignment
-    const lhs=suffixed();
-    if(pk().t==='op'&&pk().v==='='){nx();const e=expr(0);return{k:'assign',target:lhs,e};}
-    return{k:'exprstmt',e:lhs};
+    if(t.t==='kw'&&t.v==='break'){nx();return{k:'break'};}
+    if(t.t==='kw'&&t.v==='for'){nx();const n1=nx().v;
+      if(pk().t==='op'&&pk().v==='='){nx();const a=expr(0);eat(',');const b=expr(0);let step=null;if(pk().t==='op'&&pk().v===','){nx();step=expr(0);}eat('do');const body=block(['end']);eat('end');return{k:'fornum',v:n1,a,b,step,body};}
+      // generic for: for k,v in expr do
+      const names=[n1];while(pk().t==='op'&&pk().v===','){nx();names.push(nx().v);}
+      eat('in');const iter=expr(0);eat('do');const body=block(['end']);eat('end');
+      return{k:'forin',names,iter,body};
+    }
+    if(t.t==='kw'&&t.v==='return'){nx();const exprs=[];
+      if(!(pk().t==='kw'&&(pk().v==='end'||pk().v==='elseif'||pk().v==='else'))&&pk().t!=='eof'&&!(pk().t==='op'&&pk().v===';')){
+        exprs.push(expr(0));while(pk().t==='op'&&pk().v===','){nx();exprs.push(expr(0));}
+      }
+      return{k:'return',exprs};
+    }
+    if(t.t==='kw'&&t.v==='print'){nx();eat('(');const args=callargs();eat(')');return{k:'print',args};}
+    // expression statement or (multi) assignment
+    const first=suffixed();
+    if(pk().t==='op'&&(pk().v==='='||pk().v===',')){
+      const targets=[first];
+      while(pk().t==='op'&&pk().v===','){nx();targets.push(suffixed());}
+      eat('=');const exprs=[expr(0)];while(pk().t==='op'&&pk().v===','){nx();exprs.push(expr(0));}
+      return{k:'assign',targets,exprs};
+    }
+    return{k:'exprstmt',e:first};
   }
   function block(stop){const out=[];
     while(true){const t=pk();
@@ -118,8 +148,7 @@ function parse(toks){
     }
     return out;
   }
-  const prog=block([]);
-  return prog;
+  return block([]);
 }
 
 module.exports={lex,parse};

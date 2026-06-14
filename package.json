@@ -1,14 +1,12 @@
 {
-  "name": "private-lua-vm-obfuscator",
-  "version": "1.0.0",
-  "description": "Private ID-locked Discord bot that VM-obfuscates your own Lua libraries",
+  "name": "private-lua-vm-obfuscator-pro",
+  "version": "2.0.0",
+  "description": "Private ID-locked Discord bot that hardens your own Lua libraries via a custom bytecode VM",
   "main": "bot.js",
   "scripts": {
     "bot": "node bot.js",
     "build": "node emit.js",
     "test": "node refvm.js && node batch.js"
   },
-  "dependencies": {
-    "discord.js": "^14.16.3"
-  }
+  "dependencies": { "discord.js": "^14.16.3" }
 }
